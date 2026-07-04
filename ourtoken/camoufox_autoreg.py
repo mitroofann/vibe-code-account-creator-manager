@@ -66,42 +66,59 @@ def load_sessions():
     except: return []
 
 def add_to_omniroute(email, api_key):
-    """Добавить ourtoken-аккаунт в OmniRoute через прямой INSERT в БД контейнера
-    (docker exec omniroute node - <email> <apiKey> <omniApiKey>)."""
+    """Добавить ourtoken-аккаунт в OmniRoute через HTTP Management API."""
     if not api_key:
         log("omniroute", "skip: нет api_key"); return
-    import subprocess
-    script = BASE_DIR.parent / "routing" / "add-to-omniroute.js"
-    if not script.exists():
-        script = BASE_DIR / "add-to-omniroute.js"
-    if not script.exists():
-        log("omniroute", f"скрипт не найден: {script}"); return
-    # читаем OmniRoute API-ключ из .env (нужен для auto-test внутри контейнера)
-    omni_key = ""
-    env_file = BASE_DIR.parent / "routing" / ".env"
-    if env_file.exists():
-        for line in env_file.read_text(encoding="utf-8").splitlines():
-            if line.startswith("OMNIROUTE_API_KEY="):
-                omni_key = line.split("=", 1)[1].strip().strip('"').strip("'")
-                break
+    import urllib.request, urllib.error
+
+    # читаем Management API ключ из routing/.env
+    manage_key = os.environ.get("OMNI_MANAGE_KEY", "")
+    if not manage_key:
+        env_file = BASE_DIR.parent / "routing" / ".env"
+        if env_file.exists():
+            for line in env_file.read_text(encoding="utf-8").splitlines():
+                if line.startswith("OMNI_MANAGE_KEY="):
+                    manage_key = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    break
+    if not manage_key:
+        log("omniroute", "FAIL: OMNI_MANAGE_KEY не найден в routing/.env"); return
+
+    base_url = os.environ.get("OMNI_BASE_URL", "http://localhost:20128")
+    node_id = os.environ.get("OMNI_OURTOKEN_NODE", "anthropic-compatible-34c2e97b-e3f1-46cf-8fd6-cfbcd34f5655")
+    headers = {"Authorization": f"Bearer {manage_key}", "Content-Type": "application/json"}
+
     try:
-        code = script.read_text(encoding="utf-8")
-        r = subprocess.run(
-            ["docker", "exec", "-i", "omniroute", "node", "-", email, api_key, omni_key],
-            input=code, text=True, capture_output=True, timeout=30,
-            encoding="utf-8", errors="replace",
-        )
-        out = (r.stdout or "").strip()
-        err = (r.stderr or "").strip()
-        if r.returncode == 0:
-            try:
-                data = json.loads(out.splitlines()[-1]) if out else {}
-                action = data.get("action", "ok")
-            except Exception:
-                action = "ok"
-            log("omniroute", f"{email} → {action}")
-        else:
-            log("omniroute", f"FAIL: {err or out}")
+        # Проверка дубля
+        req = urllib.request.Request(f"{base_url}/api/providers", headers=headers)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+        existing = next((c for c in data.get("connections", [])
+                         if c.get("provider") == node_id and (c.get("email") == email or c.get("name") == email)), None)
+        if existing:
+            log("omniroute", f"{email} → exists"); return
+
+        # Добавляем
+        body = json.dumps({
+            "provider": node_id, "authType": "apikey",
+            "name": email, "email": email, "apiKey": api_key,
+            "priority": 1, "isActive": True,
+        }).encode()
+        req = urllib.request.Request(f"{base_url}/api/providers", data=body, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            result = json.loads(resp.read())
+        conn_id = result.get("connection", {}).get("id", "?")
+        log("omniroute", f"{email} → added ({conn_id[:8]})")
+
+        # Тест соединения
+        try:
+            test_body = json.dumps({"validationModelId": "claude-sonnet-4-6"}).encode()
+            req = urllib.request.Request(f"{base_url}/api/providers/{conn_id}/test",
+                                         data=test_body, headers=headers, method="POST")
+            urllib.request.urlopen(req, timeout=15).close()
+        except Exception:
+            pass
+    except urllib.error.HTTPError as e:
+        log("omniroute", f"FAIL: HTTP {e.code} {e.read().decode(errors='replace')[:200]}")
     except Exception as e:
         log("omniroute", f"error: {e}")
 

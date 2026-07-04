@@ -1,20 +1,12 @@
 // ourtoken/add-to-omniroute.js
-// Запускается ВНУТРИ Docker-контейнера OmniRoute.
-// Добавляет один ourtoken-аккаунт в БД OmniRoute как anthropic-compatible connection.
+// Добавляет ourtoken-аккаунт в OmniRoute через HTTP Management API.
 //
-// Запуск снаружи контейнера (авторег делает это автоматически):
-//   Get-Content ourtoken/add-to-omniroute.js | docker exec -i omniroute node - <email> <apiKey>
+// Запуск: node ourtoken/add-to-omniroute.js <email> <apiKey> [omniManageKey]
 //
-// Внутри контейнера:
-//   node /path/to/add-to-omniroute.js <email> <apiKey>
+// omniManageKey можно передать через env OMNI_MANAGE_KEY.
 
-const crypto = require('crypto');
-const Database = require('better-sqlite3');
-
-const DB_PATH = process.env.DB_PATH || '/app/data/storage.sqlite';
-const NODE_ID = process.env.OMNI_OURTOKEN_NODE || 'anthropic-compatible-bfe8d930-e4ee-4f61-9101-fc660fbd42da';
-const STATIC_SALT = 'omniroute-field-encryption-v1';
-const PREFIX = 'enc:v1:';
+const NODE_ID = process.env.OMNI_OURTOKEN_NODE || 'anthropic-compatible-34c2e97b-e3f1-46cf-8fd6-cfbcd34f5655';
+const OMNI_BASE = process.env.OMNI_BASE_URL || 'http://localhost:20128';
 
 function log(tag, msg) {
     const t = new Date().toISOString().substring(11, 23);
@@ -26,130 +18,87 @@ function maskKey(k) {
     return k.substring(0, 8) + '***' + k.slice(-4);
 }
 
-function getStaticKey(secret) {
-    return crypto.scryptSync(secret, STATIC_SALT, 32);
-}
-
-function encrypt(plaintext, secret) {
-    if (!plaintext || typeof plaintext !== 'string') return plaintext;
-    const key = getStaticKey(secret);
-    const iv = crypto.randomBytes(16);
-    const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
-    let encrypted = cipher.update(plaintext, 'utf8', 'hex');
-    encrypted += cipher.final('hex');
-    const authTag = cipher.getAuthTag().toString('hex');
-    return `${PREFIX}${iv.toString('hex')}:${encrypted}:${authTag}`;
-}
-
-function decrypt(ciphertext, secret) {
-    if (!ciphertext || typeof ciphertext !== 'string' || !ciphertext.startsWith(PREFIX)) return null;
-    try {
-        const key = getStaticKey(secret);
-        const body = ciphertext.slice(PREFIX.length);
-        const [ivHex, encryptedHex, authTagHex] = body.split(':');
-        const iv = Buffer.from(ivHex, 'hex');
-        const authTag = Buffer.from(authTagHex, 'hex');
-        const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv, { authTagLength: 16 });
-        decipher.setAuthTag(authTag);
-        let decrypted = decipher.update(encryptedHex, 'hex', 'utf8');
-        decrypted += decipher.final('utf8');
-        return decrypted;
-    } catch (err) {
-        return null;
-    }
-}
-
 async function main() {
-    const [email, apiKey, omniApiKey] = process.argv.slice(2);
+    const [email, apiKey, argManageKey] = process.argv.slice(2);
     if (!email || !apiKey) {
-        console.error(JSON.stringify({ ok: false, error: 'usage: node add-to-omniroute.js <email> <apiKey> [omniApiKey]' }));
+        console.error(JSON.stringify({ ok: false, error: 'usage: node add-to-omniroute.js <email> <apiKey> [omniManageKey]' }));
         process.exit(1);
     }
 
-    const authHeaders = omniApiKey
-        ? { 'Content-Type': 'application/json', 'authorization': 'Bearer ' + omniApiKey }
-        : { 'Content-Type': 'application/json' };
-
-    const secret = process.env.STORAGE_ENCRYPTION_KEY;
-    if (!secret) {
-        console.error(JSON.stringify({ ok: false, error: 'STORAGE_ENCRYPTION_KEY not set' }));
+    const manageKey = argManageKey || process.env.OMNI_MANAGE_KEY;
+    if (!manageKey) {
+        console.error(JSON.stringify({ ok: false, error: 'Management key required: pass as 3rd arg or set OMNI_MANAGE_KEY' }));
         process.exit(1);
     }
 
+    const headers = {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ' + manageKey,
+    };
+
+    // Проверка дубля по email через список всех connections
+    const listRes = await fetch(`${OMNI_BASE}/api/providers`, { headers });
+    if (!listRes.ok) {
+        const body = await listRes.text();
+        console.error(JSON.stringify({ ok: false, error: `Failed to list providers: ${listRes.status} ${body}` }));
+        process.exit(1);
+    }
+    const { connections } = await listRes.json();
+    const existing = connections.find(c =>
+        c.provider === NODE_ID && (c.email === email || c.name === email || c.apiKey?.startsWith(apiKey.substring(0, 8)))
+    );
+    if (existing) {
+        log('exists', `${email} already in OmniRoute as ${existing.id}`);
+        console.log(JSON.stringify({ ok: true, id: existing.id, action: 'exists', email }));
+        return;
+    }
+
+    // Добавляем через POST /api/providers
+    const addRes = await fetch(`${OMNI_BASE}/api/providers`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+            provider: NODE_ID,
+            authType: 'apikey',
+            name: email,
+            email: email,
+            apiKey: apiKey,
+            priority: 1,
+            isActive: true,
+        }),
+    });
+    if (!addRes.ok) {
+        const body = await addRes.text();
+        console.error(JSON.stringify({ ok: false, error: `Failed to add provider: ${addRes.status} ${body}` }));
+        process.exit(1);
+    }
+    const { connection } = await addRes.json();
+    const id = connection.id;
+    log('added', `${email} -> ${maskKey(apiKey)} as ${id}`);
+
+    // Тест соединения
     try {
-        const db = new Database(DB_PATH);
-
-        // Проверка дубля: по email, затем по расшифрованному ключу
-        const existingByEmail = db.prepare(`SELECT id, name FROM provider_connections WHERE provider = ? AND (name = ? OR email = ?)`).get(NODE_ID, email, email);
-        if (existingByEmail) {
-            console.log(JSON.stringify({ ok: true, id: existingByEmail.id, action: 'exists', email }));
-            db.close();
-            return;
-        }
-
-        const rows = db.prepare(`SELECT id, api_key FROM provider_connections WHERE provider = ? AND api_key IS NOT NULL`).all(NODE_ID);
-        for (const row of rows) {
-            const dec = decrypt(row.api_key, secret);
-            if (dec === apiKey) {
-                console.log(JSON.stringify({ ok: true, id: row.id, action: 'exists', email }));
-                db.close();
-                return;
-            }
-        }
-
-        const id = crypto.randomUUID();
-        const now = new Date().toISOString();
-        const encryptedKey = encrypt(apiKey, secret);
-        const providerData = JSON.stringify({
-            prefix: 'ourtoken',
-            baseUrl: 'https://api.ourtoken.ai/v1',
-            nodeName: 'ourtoken.ai',
-            apiKeyHealth: {},
+        const ctrl = new AbortController();
+        const t = setTimeout(() => ctrl.abort(), 15000);
+        const testRes = await fetch(`${OMNI_BASE}/api/providers/${id}/test`, {
+            method: 'POST',
+            headers,
+            signal: ctrl.signal,
+            body: JSON.stringify({ validationModelId: 'claude-sonnet-4-6' }),
         });
-
-        db.prepare(`INSERT INTO provider_connections
-            (id, provider, auth_type, name, email, priority, is_active, test_status, backoff_level, api_key,
-             provider_specific_data, consecutive_use_count, rate_limit_protection, created_at, updated_at,
-             proxy_enabled, per_key_proxy_enabled, max_concurrent, quota_window_thresholds_json, rate_limit_overrides_json)
-            VALUES
-            (?, ?, 'apikey', ?, ?, 1, 1, 'unknown', 0, ?,
-             ?, 0, 0, ?, ?, 1, 0, NULL, NULL, NULL)`)
-            .run(id, NODE_ID, email, email, encryptedKey, providerData, now, now);
-
-        db.close();
-
-        // Auto-test + активация через прямой UPDATE (PUT API непредсказуем с полями)
-        try {
-            const ctrl = new AbortController();
-            const t = setTimeout(() => ctrl.abort(), 15000);
-            let passed = false;
-            try {
-                const res = await fetch(`http://localhost:20128/api/providers/${id}/test`, {
-                    method: 'POST', signal: ctrl.signal, headers: authHeaders,
-                    body: JSON.stringify({ validationModelId: 'deepseek-v4-flash' }),
-                });
-                clearTimeout(t);
-                if (res.ok) {
-                    const testData = await res.json().catch(() => ({}));
-                    passed = testData.valid === true;
-                }
-            } finally { clearTimeout(t); }
-            // прямой UPDATE — PUT API нестабилен с названиями полей
-            const db2 = new Database(DB_PATH);
-            db2.prepare(`UPDATE provider_connections SET test_status = ?, is_active = 1, last_tested = ? WHERE id = ?`)
-                .run(passed ? 'active' : 'active', new Date().toISOString(), id);
-            db2.close();
-            log(passed ? 'test' : 'activate', `${email} -> ${passed ? 'connected' : 'forced active'}`);
-        } catch (err) {
-            log('warn', `${email} -> test/activate failed: ${err.message} (ключ останется unknown)`);
+        clearTimeout(t);
+        if (testRes.ok) {
+            const data = await testRes.json().catch(() => ({}));
+            log(data.valid ? 'test' : 'test', `${email} -> ${data.valid ? 'connected' : 'test failed, stays active'}`);
         }
-
-        log('ok', `${email} -> ${maskKey(apiKey)} added as ${id}`);
-        console.log(JSON.stringify({ ok: true, id, email, action: 'added' }));
     } catch (err) {
-        console.error(JSON.stringify({ ok: false, error: err.message }));
-        process.exit(1);
+        log('warn', `${email} -> test skipped: ${err.message}`);
     }
+
+    console.log(JSON.stringify({ ok: true, id, email, action: 'added' }));
 }
 
-main();
+main().catch(err => {
+    console.error(JSON.stringify({ ok: false, error: err.message }));
+    process.exit(1);
+});
